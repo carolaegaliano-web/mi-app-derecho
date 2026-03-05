@@ -1,0 +1,156 @@
+import streamlit as st
+import PyPDF2
+from openai import OpenAI
+import sqlite3
+import pandas as pd
+
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="LexIA - Tu Tutor de Derecho", page_icon="⚖️", layout="wide")
+
+# --- BASE DE DATOS (SQLite) ---
+# Esto crea una base de datos local para guardar tus materias
+conn = sqlite3.connect('derecho_app.db', check_same_thread=False)
+c = conn.cursor()
+c.execute('CREATE TABLE IF NOT EXISTS materias (id INTEGER PRIMARY KEY, nombre TEXT, profesor TEXT)')
+c.execute('CREATE TABLE IF NOT EXISTS apuntes (id INTEGER PRIMARY KEY, materia_id INTEGER, nombre_archivo TEXT, texto TEXT)')
+conn.commit()
+
+# --- BARRA LATERAL: CONFIGURACIÓN Y NAVEGACIÓN ---
+st.sidebar.title("⚖️ LexIA")
+api_key = st.sidebar.text_input("🔑 Tu OpenAI API Key", type="password", help="Consíguela en platform.openai.com")
+
+menu = st.sidebar.radio("Navegación", ["📚 Mis Materias", "🧠 Sala de Estudio"])
+
+# --- FUNCIONES DE IA ---
+def generar_respuesta_ia(prompt, texto, api_key):
+    if not api_key:
+        return "⚠️ Por favor, ingresa tu API Key de OpenAI en la barra lateral."
+    try:
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo", # Puedes cambiar a gpt-4o para mayor calidad
+            messages=[
+                {"role": "system", "content": "Eres un catedrático experto en Derecho. Tu objetivo es ayudar a un estudiante universitario a aprobar sus exámenes. Sé claro, preciso y usa terminología jurídica correcta."},
+                {"role": "user", "content": f"{prompt}\n\nTexto de referencia:\n{texto[:10000]}"} # Limitamos a 10k caracteres por costo
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error con la IA: {e}"
+
+# --- PANTALLA 1: GESTIÓN DE MATERIAS ---
+if menu == "📚 Mis Materias":
+    st.title("Gestión de Materias")
+    
+    # Agregar Materia
+    with st.expander("➕ Agregar Nueva Materia", expanded=True):
+        col1, col2 = st.columns(2)
+        nuevo_nombre = col1.text_input("Nombre de la Materia (Ej. Derecho Penal I)")
+        nuevo_profesor = col2.text_input("Profesor titular")
+        if st.button("Guardar Materia"):
+            if nuevo_nombre:
+                c.execute('INSERT INTO materias (nombre, profesor) VALUES (?, ?)', (nuevo_nombre, nuevo_profesor))
+                conn.commit()
+                st.success(f"Materia '{nuevo_nombre}' agregada.")
+            else:
+                st.warning("El nombre es obligatorio.")
+
+    # Lista de Materias
+    st.subheader("Tus Materias Actuales")
+    df_materias = pd.read_sql_query("SELECT id, nombre as Materia, profesor as Profesor FROM materias", conn)
+    if not df_materias.empty:
+        st.dataframe(df_materias, hide_index=True, use_container_width=True)
+        
+        # Eliminar materia
+        eliminar_id = st.selectbox("Selecciona el ID de la materia a eliminar", df_materias['id'].tolist())
+        if st.button("🗑️ Eliminar Materia"):
+            c.execute('DELETE FROM materias WHERE id=?', (eliminar_id,))
+            c.execute('DELETE FROM apuntes WHERE materia_id=?', (eliminar_id,))
+            conn.commit()
+            st.success("Materia eliminada. Recarga la página.")
+    else:
+        st.info("Aún no has agregado ninguna materia.")
+
+# --- PANTALLA 2: SALA DE ESTUDIO ---
+elif menu == "🧠 Sala de Estudio":
+    st.title("Sala de Estudio con IA")
+    
+    materias = pd.read_sql_query("SELECT * FROM materias", conn)
+    if materias.empty:
+        st.warning("Primero debes agregar una materia en la sección 'Mis Materias'.")
+    else:
+        # Seleccionar Materia
+        materia_seleccionada = st.selectbox("¿Qué materia vamos a estudiar hoy?", materias['nombre'].tolist())
+        materia_id = materias[materias['nombre'] == materia_seleccionada]['id'].values[0]
+        
+        st.divider()
+        
+        # Subir Material
+        st.subheader("1. Sube tu material (PDF)")
+        archivo_pdf = st.file_uploader("Sube leyes, jurisprudencia o apuntes", type="pdf")
+        
+        if archivo_pdf:
+            if st.button("Procesar y Guardar PDF"):
+                with st.spinner("Leyendo documento..."):
+                    lector = PyPDF2.PdfReader(archivo_pdf)
+                    texto_extraido = "".join([pagina.extract_text() for pagina in lector.pages])
+                    
+                    c.execute('INSERT INTO apuntes (materia_id, nombre_archivo, texto) VALUES (?, ?, ?)', 
+                              (int(materia_id), archivo_pdf.name, texto_extraido))
+                    conn.commit()
+                    st.success("¡Material guardado en tu base de datos!")
+
+        # Seleccionar Material Guardado
+        apuntes = pd.read_sql_query(f"SELECT * FROM apuntes WHERE materia_id={materia_id}", conn)
+        
+        if not apuntes.empty:
+            st.subheader("2. Herramientas de Estudio")
+            apunte_seleccionado = st.selectbox("Selecciona un documento para estudiar:", apuntes['nombre_archivo'].tolist())
+            texto_estudio = apuntes[apuntes['nombre_archivo'] == apunte_seleccionado]['texto'].values[0]
+            
+            # Pestañas de IA
+            tab1, tab2, tab3, tab4 = st.tabs(["📝 Resumen", "🃏 Flashcards", "📝 Simulacro de Examen", "🎧 Podcast"])
+            
+            with tab1:
+                st.write("Genera un resumen estructurado con los puntos clave y artículos mencionados.")
+                if st.button("Generar Resumen"):
+                    with st.spinner("Analizando textos legales..."):
+                        prompt = "Haz un resumen exhaustivo pero fácil de entender de este texto. Usa viñetas, destaca conceptos clave en negrita y menciona los artículos de ley si los hay."
+                        st.write(generar_respuesta_ia(prompt, texto_estudio, api_key))
+            
+            with tab2:
+                st.write("Crea tarjetas de memorización rápida.")
+                if st.button("Generar Flashcards"):
+                    with st.spinner("Creando tarjetas..."):
+                        prompt = "Crea 10 flashcards (Pregunta y Respuesta) basadas estrictamente en este texto. Formato: **Pregunta:** [pregunta] \n **Respuesta:** [respuesta]"
+                        st.write(generar_respuesta_ia(prompt, texto_estudio, api_key))
+                        
+            with tab3:
+                st.write("Ponte a prueba con un examen Multiple Choice.")
+                if st.button("Generar Simulacro"):
+                    with st.spinner("Redactando examen..."):
+                        prompt = "Crea un examen de opción múltiple de 5 preguntas basado en este texto. Al final del examen, provee las respuestas correctas con una breve justificación jurídica."
+                        st.write(generar_respuesta_ia(prompt, texto_estudio, api_key))
+                        
+            with tab4:
+                st.write("Convierte tu apunte en un audio para escuchar en el transporte.")
+                if st.button("Generar Audio (Podcast)"):
+                    if not api_key:
+                        st.error("Necesitas la API Key para generar audio.")
+                    else:
+                        with st.spinner("Grabando podcast jurídico..."):
+                            try:
+                                client = OpenAI(api_key=api_key)
+                                # Primero resumimos para que el audio no dure 3 horas
+                                resumen_audio = generar_respuesta_ia("Haz un guion de radio de 2 minutos explicando este tema de forma amena para un estudiante.", texto_estudio, api_key)
+                                
+                                response = client.audio.speech.create(
+                                    model="tts-1",
+                                    voice="onyx", # Voz masculina profunda (puedes cambiar a 'nova' para voz femenina)
+                                    input=resumen_audio
+                                )
+                                response.stream_to_file("podcast.mp3")
+                                st.audio("podcast.mp3")
+                                st.success("¡Audio generado!")
+                            except Exception as e:
+                                st.error(f"Error al generar audio: {e}")
